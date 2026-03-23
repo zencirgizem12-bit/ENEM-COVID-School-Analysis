@@ -1,4 +1,4 @@
-# --------------------------------------
+# ---------------------------------------
 # 01_process_raw.R
 # Process raw ENEM data to municipality-level aggregates
 # Years: 2017, 2018, 2019, 2021 (2020 excluded)
