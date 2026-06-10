@@ -1,0 +1,435 @@
+# ======================================================
+# 01_load_data.R
+# Load ENEM panel, merge excess mortality, create treatment and instrument
+# ======================================================
+
+library(dplyr)
+
+# Load ENEM city panel (2017-2021)
+city_panel_full <- readRDS("C:/Users/Admin/Desktop/4.step/nufus_verisi/city_panel_2017_2021.rds")
+
+# Load excess mortality (calculated separately)
+excess <- read.csv("C:/Users/Admin/Desktop/4.step/excess_mortality_brazil_2020_corrected.csv")
+
+# Merge excess mortality into panel
+city_panel_full <- city_panel_full %>%
+  left_join(excess[, c("municipio_code", "excess_mortality_positive")],
+            by = c("city_code" = "municipio_code"))
+
+# Create post-2021 dummy
+city_panel_full$post2021 <- ifelse(city_panel_full$year == 2021, 1, 0)
+
+# Standardize key variables
+city_panel_full$internet_std <- scale(city_panel_full$pct_full_remote)
+city_panel_full$excess_std <- scale(city_panel_full$excess_mortality_positive)
+
+# Create treatment (D) and instrument (Z)
+city_panel_full$D <- city_panel_full$post2021 * city_panel_full$internet_std
+city_panel_full$Z <- city_panel_full$post2021 * city_panel_full$excess_std * city_panel_full$internet_std
+
+# Save processed data
+saveRDS(city_panel_full, "city_panel_processed.rds")
+
+
+# ======================================================
+# 02_excess_mortality.R
+# Calculate excess mortality from SIM data (BigQuery export)
+# ======================================================
+
+# Load SIM mortality data (downloaded from BigQuery)
+obitos <- read.csv("C:/Users/Admin/Downloads/sim_obitos_2015_2020.csv")
+colnames(obitos) <- c("ano", "id_municipio", "obitos")
+
+# Load population data (processed from IBGE Excel files)
+pop <- read.csv("C:/Users/Admin/Desktop/populasyon/brazil_municipality_population_2015_2020_corrected.csv")
+pop$population <- as.numeric(gsub("\\.", "", pop$population))
+pop$municipio_code <- as.integer(pop$municipio_code)
+
+# Merge and calculate mortality rates
+merged <- merge(pop, obitos,
+                by.x = c("year", "municipio_code"),
+                by.y = c("ano", "id_municipio"),
+                all.x = TRUE)
+merged$obitos[is.na(merged$obitos)] <- 0
+merged$mortality_rate <- (merged$obitos / merged$population) * 100000
+merged <- merged[merged$population > 0 & is.finite(merged$mortality_rate), ]
+
+# Compute expected 2020 mortality using 2015-2019 linear trend (municipality-specific)
+municipalities <- unique(merged$municipio_code)
+trend_list <- list()
+
+for (mun in municipalities) {
+  d <- merged[merged$municipio_code == mun & merged$year %in% 2015:2019, ]
+  if (nrow(d) < 3) next
+  d$log_rate <- log(d$mortality_rate + 0.01)
+  mod <- lm(log_rate ~ year, data = d)
+  pred_log <- predict(mod, newdata = data.frame(year = 2020))
+  expected_rate <- exp(pred_log) - 0.01
+  trend_list[[as.character(mun)]] <- data.frame(
+    municipio_code = mun,
+    expected_mortality_2020 = as.numeric(expected_rate)
+  )
+}
+expected_df <- do.call(rbind, trend_list)
+
+# Actual 2020 mortality
+actual_2020 <- merged[merged$year == 2020, c("municipio_code", "mortality_rate")]
+colnames(actual_2020)[2] <- "actual_mortality_2020"
+
+# Calculate excess mortality
+excess <- merge(actual_2020, expected_df, by = "municipio_code", all = TRUE)
+excess$excess_mortality <- excess$actual_mortality_2020 - excess$expected_mortality_2020
+excess$excess_mortality[is.na(excess$excess_mortality)] <- 0
+excess$excess_mortality_positive <- pmax(excess$excess_mortality, 0)
+
+# Save results
+write.csv(excess, "excess_mortality_brazil_2020_corrected.csv", row.names = FALSE)
+
+# ======================================================
+# 03_did_iv_models.R
+# Estimate DiD and IV models with clustered standard errors
+# ======================================================
+
+library(lmtest)
+library(sandwich)
+library(AER)
+
+# Load processed data
+city_panel_full <- readRDS("city_panel_processed.rds")
+
+# DiD (simple)
+did1 <- lm(math_mean ~ D + factor(city_code) + factor(year), data = city_panel_full)
+did1_clustered <- coeftest(did1, vcov = vcovCL, cluster = ~ city_code)
+
+# DiD + controls (income median and urban share)
+did2 <- lm(math_mean ~ D + income_median + pct_urban + factor(city_code) + factor(year),
+           data = city_panel_full)
+did2_clustered <- coeftest(did2, vcov = vcovCL, cluster = ~ city_code)
+
+# IV (simple)
+iv1 <- ivreg(math_mean ~ D + factor(city_code) + factor(year) |
+               Z + factor(city_code) + factor(year), data = city_panel_full)
+iv1_summary <- summary(iv1, diagnostics = TRUE)
+
+# IV + controls
+iv2 <- ivreg(math_mean ~ D + income_median + pct_urban + factor(city_code) + factor(year) |
+               Z + income_median + pct_urban + factor(city_code) + factor(year),
+             data = city_panel_full)
+iv2_summary <- summary(iv2, diagnostics = TRUE)
+
+# Save results
+save(did1_clustered, did2_clustered, iv1_summary, iv2_summary,
+     file = "model_results.RData")
+
+# Print key coefficients
+cat("\n=== DiD (simple) ===\n")
+print(did1_clustered["D", ])
+cat("\n=== DiD + controls ===\n")
+print(did2_clustered["D", ])
+cat("\n=== IV (simple) ===\n")
+print(iv1_summary$coefficients["D", ])
+cat("\n=== IV + controls ===\n")
+print(iv2_summary$coefficients["D", ])
+
+# ======================================================
+# 04_heterogeneity_placebo.R
+# High/low mortality split and placebo tests
+# ======================================================
+
+library(lmtest)
+library(sandwich)
+
+# Load processed data
+city_panel_full <- readRDS("city_panel_processed.rds")
+
+# High vs low mortality split (median split)
+med_excess <- median(city_panel_full$excess_mortality_positive, na.rm = TRUE)
+city_panel_full$high_mort <- ifelse(city_panel_full$excess_mortality_positive > med_excess, 1, 0)
+
+# DiD on high mortality subsample
+did_high <- lm(math_mean ~ D + factor(city_code) + factor(year),
+               data = city_panel_full[city_panel_full$high_mort == 1, ])
+did_high_clustered <- coeftest(did_high, vcov = vcovCL, cluster = ~ city_code)
+
+# DiD on low mortality subsample
+did_low <- lm(math_mean ~ D + factor(city_code) + factor(year),
+              data = city_panel_full[city_panel_full$high_mort == 0, ])
+did_low_clustered <- coeftest(did_low, vcov = vcovCL, cluster = ~ city_code)
+
+# Placebo test with fake post = 2018 (using 2017-2019 sample)
+placebo_data <- subset(city_panel_full, year %in% c(2017, 2018, 2019))
+placebo_data$post2018 <- ifelse(placebo_data$year == 2018, 1, 0)
+placebo_data$D_placebo <- placebo_data$post2018 * placebo_data$internet_std
+
+did_placebo <- lm(math_mean ~ D_placebo + factor(city_code) + factor(year), data = placebo_data)
+did_placebo_clustered <- coeftest(did_placebo, vcov = vcovCL, cluster = ~ city_code)
+
+# Save results
+save(did_high_clustered, did_low_clustered, did_placebo_clustered,
+     file = "heterogeneity_placebo_results.RData")
+
+# Print results
+cat("\n=== High mortality subsample DiD ===\n")
+print(did_high_clustered["D", ])
+cat("\n=== Low mortality subsample DiD ===\n")
+print(did_low_clustered["D", ])
+cat("\n=== Placebo DiD (fake post = 2018) ===\n")
+print(did_placebo_clustered["D_placebo", ])
+
+# ======================================================
+# 05_figures.R
+# Generate all 8 figures and save to Downloads folder
+# ======================================================
+
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+library(lmtest)
+library(sandwich)
+
+# Load data
+city_panel_full <- readRDS("city_panel_processed.rds")
+excess <- read.csv("excess_mortality_brazil_2020_corrected.csv")
+
+# Set Downloads folder path
+downloads_path <- "C:/Users/Admin/Downloads/"
+
+# -----------------------------------------------------
+# Figure 1: Internet access quality (stacked bar chart)
+# -----------------------------------------------------
+fig1_data <- city_panel_full %>%
+  group_by(year) %>%
+  summarise(
+    no_internet = weighted.mean(pct_no_internet, n_students, na.rm = TRUE),
+    mobile_only = weighted.mean(pct_mobile_internet, n_students, na.rm = TRUE),
+    full_remote = weighted.mean(pct_full_remote, n_students, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = -year, names_to = "type", values_to = "proportion")
+
+fig1_data$type <- factor(fig1_data$type,
+                         levels = c("no_internet", "mobile_only", "full_remote"),
+                         labels = c("No internet", "Mobile only", "Full remote"))
+
+p1 <- ggplot(fig1_data, aes(x = year, y = proportion, fill = type)) +
+  geom_bar(stat = "identity", position = "stack") +
+  scale_fill_manual(values = c("No internet" = "#D55E00", "Mobile only" = "#F0E442", "Full remote" = "#009E73")) +
+  labs(x = "Year", y = "Proportion of test-takers",
+       title = "Figure 1: Internet Access Quality Among ENEM Test-Takers (2017-2021)") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom", legend.title = element_blank()) +
+  scale_x_continuous(breaks = 2017:2021)
+ggsave(paste0(downloads_path, "figure1_internet_access.png"), plot = p1, width = 8, height = 5, dpi = 300)
+
+# -----------------------------------------------------
+# Figure 2: Cross-sectional relationship (2017)
+# -----------------------------------------------------
+fig2_data <- city_panel_full %>% filter(year == 2017)
+p2 <- ggplot(fig2_data, aes(x = pct_full_remote, y = math_mean)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "lm", se = TRUE, color = "red", fill = "gray80") +
+  labs(x = "Full remote capacity share (2017)", y = "Average math score (2017)",
+       title = "Figure 2: Cross-sectional Relationship (2017)") +
+  theme_minimal(base_size = 12)
+ggsave(paste0(downloads_path, "figure2_cross_section_2017.png"), plot = p2, width = 7, height = 5, dpi = 300)
+
+# -----------------------------------------------------
+# Figure 3: Excess mortality distribution
+# -----------------------------------------------------
+p3 <- ggplot(excess, aes(x = excess_mortality_positive)) +
+  geom_histogram(binwidth = 20, fill = "steelblue", color = "black", alpha = 0.7) +
+  geom_vline(xintercept = median(excess$excess_mortality_positive, na.rm = TRUE),
+             linetype = "dashed", color = "red", linewidth = 1) +
+  annotate("text", x = median(excess$excess_mortality_positive, na.rm = TRUE) + 50, y = 200,
+           label = paste("Median =", round(median(excess$excess_mortality_positive, na.rm = TRUE), 1)),
+           color = "red", hjust = 0) +
+  labs(x = "Excess mortality (per 100,000 inhabitants)", y = "Number of municipalities",
+       title = "Figure 3: Distribution of Excess Mortality (SIM, 2020)") +
+  theme_minimal(base_size = 12)
+ggsave(paste0(downloads_path, "figure3_excess_mortality.png"), plot = p3, width = 7, height = 5, dpi = 300)
+
+# -----------------------------------------------------
+# Figure 4: Mean income rank over years
+# -----------------------------------------------------
+fig4_data <- city_panel_full %>%
+  group_by(year) %>%
+  summarise(mean_income = weighted.mean(income_median, n_students, na.rm = TRUE))
+p4 <- ggplot(fig4_data, aes(x = year, y = mean_income)) +
+  geom_line(size = 1.2, color = "darkgreen") +
+  geom_point(size = 3, color = "darkgreen") +
+  labs(x = "Year", y = "Mean income rank (1-6)",
+       title = "Figure 4: Mean Income Rank Among ENEM Test-Takers") +
+  scale_x_continuous(breaks = 2017:2021) +
+  theme_minimal(base_size = 12)
+ggsave(paste0(downloads_path, "figure4_income_rank.png"), plot = p4, width = 6, height = 4, dpi = 300)
+
+# -----------------------------------------------------
+# Figure 5: Average scores by subject
+# -----------------------------------------------------
+fig5_data <- city_panel_full %>%
+  group_by(year) %>%
+  summarise(
+    Math = weighted.mean(math_mean, n_students, na.rm = TRUE),
+    Science = weighted.mean(science_mean, n_students, na.rm = TRUE),
+    Humanities = weighted.mean(human_mean, n_students, na.rm = TRUE),
+    Language = weighted.mean(language_mean, n_students, na.rm = TRUE),
+    Essay = weighted.mean(essay_mean, n_students, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = -year, names_to = "subject", values_to = "score")
+
+fig5_data$subject <- factor(fig5_data$subject,
+                            levels = c("Essay", "Language", "Humanities", "Science", "Math"))
+p5 <- ggplot(fig5_data, aes(x = year, y = score, color = subject, group = subject)) +
+  geom_line(size = 1.2) + geom_point(size = 2) +
+  labs(x = "Year", y = "Average score",
+       title = "Figure 5: Average ENEM Scores by Subject (2017-2021)") +
+  scale_x_continuous(breaks = 2017:2021) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+ggsave(paste0(downloads_path, "figure5_scores_by_subject.png"), plot = p5, width = 8, height = 5, dpi = 300)
+
+# -----------------------------------------------------
+# Figure 6: Event study (internet x year coefficients)
+# -----------------------------------------------------
+city_panel_full$inter_2017 <- city_panel_full$internet_std * (city_panel_full$year == 2017)
+city_panel_full$inter_2018 <- city_panel_full$internet_std * (city_panel_full$year == 2018)
+city_panel_full$inter_2021 <- city_panel_full$internet_std * (city_panel_full$year == 2021)
+
+event_model <- lm(math_mean ~ inter_2017 + inter_2018 + inter_2021 +
+                    factor(city_code) + factor(year), data = city_panel_full)
+
+coefs <- coef(event_model)[c("inter_2017", "inter_2018", "inter_2021")]
+vcov_mat <- vcovCL(event_model, cluster = ~ city_code)
+ses <- sqrt(diag(vcov_mat))[c("inter_2017", "inter_2018", "inter_2021")]
+
+fig6_data <- data.frame(
+  year = c(2017, 2018, 2021),
+  coef = coefs,
+  lower = coefs - 1.96 * ses,
+  upper = coefs + 1.96 * ses
+)
+fig6_data <- rbind(fig6_data, data.frame(year = 2019, coef = 0, lower = 0, upper = 0))
+
+p6 <- ggplot(fig6_data, aes(x = year, y = coef)) +
+  geom_point(size = 3) +
+  geom_errorbar(aes(ymin = lower, ymax = upper), width = 0.2) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(x = "Year", y = "Coefficient (Internet_std × Year)",
+       title = "Figure 6: Event Study (Reference Year = 2019)") +
+  scale_x_continuous(breaks = c(2017, 2018, 2019, 2021)) +
+  theme_minimal(base_size = 12)
+ggsave(paste0(downloads_path, "figure6_event_study.png"), plot = p6, width = 6, height = 4, dpi = 300)
+
+# -----------------------------------------------------
+# Figure 7: Math scores by internet and mortality groups
+# -----------------------------------------------------
+med_internet <- median(city_panel_full$internet_std, na.rm = TRUE)
+med_mort <- median(city_panel_full$excess_mortality_positive, na.rm = TRUE)
+
+city_panel_full$internet_group <- ifelse(city_panel_full$internet_std > med_internet,
+                                         "High internet", "Low internet")
+city_panel_full$mort_group <- ifelse(city_panel_full$excess_mortality_positive > med_mort,
+                                     "High mortality", "Low mortality")
+
+fig7_data <- city_panel_full %>%
+  group_by(year, internet_group, mort_group) %>%
+  summarise(mean_math = weighted.mean(math_mean, n_students, na.rm = TRUE), .groups = "drop")
+
+p7 <- ggplot(fig7_data, aes(x = year, y = mean_math, color = internet_group, linetype = mort_group)) +
+  geom_line(size = 1.2) + geom_point(size = 2.5) +
+  labs(x = "Year", y = "Average math score",
+       title = "Figure 7: Math Scores by Internet Access and Excess Mortality") +
+  scale_x_continuous(breaks = 2017:2021) +
+  theme_minimal(base_size = 12) + theme(legend.position = "bottom") +
+  scale_color_manual(values = c("High internet" = "blue", "Low internet" = "red"))
+ggsave(paste0(downloads_path, "figure7_scores_by_groups.png"), plot = p7, width = 7, height = 5, dpi = 300)
+
+# -----------------------------------------------------
+# Figure 8: Private vs public school gap
+# -----------------------------------------------------
+fig8_data <- city_panel_full %>%
+  group_by(year) %>%
+  summarise(
+    Private = weighted.mean(private_math_mean, n_private, na.rm = TRUE),
+    Public = weighted.mean(public_math_mean, n_public, na.rm = TRUE)
+  ) %>%
+  pivot_longer(cols = -year, names_to = "school_type", values_to = "score")
+
+p8 <- ggplot(fig8_data, aes(x = year, y = score, color = school_type, group = school_type)) +
+  geom_line(size = 1.2) + geom_point(size = 3) +
+  labs(x = "Year", y = "Average math score",
+       title = "Figure 8: Private vs Public School Math Scores (Corrected Aggregation)") +
+  scale_x_continuous(breaks = 2017:2021) +
+  theme_minimal(base_size = 12) +
+  scale_color_manual(values = c("Private" = "darkorange", "Public" = "steelblue"))
+ggsave(paste0(downloads_path, "figure8_private_public_gap.png"), plot = p8, width = 6, height = 4, dpi = 300)
+
+cat("\n✅ All 8 figures saved to:", downloads_path, "\n")
+
+# ======================================================
+# 06_iv_positive_mort.R
+# IV only on municipalities with positive excess mortality
+# ======================================================
+
+library(AER)
+library(lmtest)
+library(sandwich)
+
+# Load processed data
+city_panel_full <- readRDS("city_panel_processed.rds")
+
+# Keep only municipalities with positive excess mortality
+positive_mort <- city_panel_full[city_panel_full$excess_mortality_positive > 0, ]
+
+# IV on positive mortality subsample (simple)
+iv_pos <- ivreg(math_mean ~ D + factor(city_code) + factor(year) |
+                  Z + factor(city_code) + factor(year), data = positive_mort)
+iv_pos_summary <- summary(iv_pos, diagnostics = TRUE)
+
+# IV + controls on positive mortality subsample
+iv_pos_controls <- ivreg(math_mean ~ D + income_median + pct_urban + factor(city_code) + factor(year) |
+                           Z + income_median + pct_urban + factor(city_code) + factor(year),
+                         data = positive_mort)
+iv_pos_controls_summary <- summary(iv_pos_controls, diagnostics = TRUE)
+
+# Save results
+save(iv_pos_summary, iv_pos_controls_summary, file = "iv_positive_mort_results.RData")
+
+# Print results
+cat("\n=== IV (positive mortality subsample, simple) ===\n")
+print(iv_pos_summary$coefficients["D", ])
+cat("\n=== First-stage F statistic ===\n")
+print(iv_pos_summary$diagnostics["Weak instruments", ])
+cat("\n=== IV + controls (positive mortality subsample) ===\n")
+print(iv_pos_controls_summary$coefficients["D", ])
+
+# ======================================================
+# 00_master.R
+# Run entire analysis from start to finish
+# ======================================================
+
+cat("\n========================================\n")
+cat("Starting full replication...\n")
+cat("========================================\n\n")
+
+source("01_load_data.R")
+cat("\n✅ 01_load_data.R completed\n\n")
+
+source("02_excess_mortality.R")
+cat("\n✅ 02_excess_mortality.R completed\n\n")
+
+source("03_did_iv_models.R")
+cat("\n✅ 03_did_iv_models.R completed\n\n")
+
+source("04_heterogeneity_placebo.R")
+cat("\n✅ 04_heterogeneity_placebo.R completed\n\n")
+
+source("05_figures.R")
+cat("\n✅ 05_figures.R completed\n\n")
+
+source("06_iv_positive_mort.R")
+cat("\n✅ 06_iv_positive_mort.R completed\n\n")
+
+cat("\n========================================\n")
+cat("All analyses completed successfully!\n")
+cat("========================================\n")
+
